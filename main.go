@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const NumberOfRequestedNews = 5
+const numberOfRequestedNews = 5
 
 type NewsletterNewsItem struct {
 	ArticleURL        string `bson:"article_url" xml:"ArticleURL"`
@@ -201,7 +201,7 @@ func NewRepository() *Repository {
 func (c *Cron) Run(duration time.Duration) {
 	go func() {
 		for {
-			url := fmt.Sprintf("https://www.htafc.com/api/incrowd/getnewlistinformation?count=%d", NumberOfRequestedNews)
+			url := fmt.Sprintf("https://www.htafc.com/api/incrowd/getnewlistinformation?count=%d", numberOfRequestedNews)
 			response, err := c.client.R().Get(url)
 			if err != nil {
 				log.Println("Ошибка при выполнении GET-запроса:", err)
@@ -209,7 +209,7 @@ func (c *Cron) Run(duration time.Duration) {
 			}
 
 			var newsItems NewsletterNewsItems
-			newItemsNewsToInsert := make([]NewsletterNewsItem, 0, NumberOfRequestedNews)
+			newItemsNewsToInsert := make([]NewsletterNewsItem, 0, numberOfRequestedNews)
 			err = xml.Unmarshal(response.Body(), &newsItems)
 			if err != nil {
 				log.Println("Ошибка при разборе XML:", err)
