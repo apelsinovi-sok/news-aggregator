@@ -16,7 +16,11 @@ import (
 	"time"
 )
 
-const numberOfRequestedNews = 5
+const (
+	numberOfRequestedNews = 5
+	databaseName          = "mydatabase"
+	collectionName        = "news"
+)
 
 type NewsletterNewsItem struct {
 	ArticleURL        string `bson:"article_url" xml:"ArticleURL"`
@@ -49,12 +53,29 @@ type Cron struct {
 
 func main() {
 	repository := NewRepository()
-	NewCron(repository).Run(time.Second * 3)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	defer func() {
+		cancel()
+		err := repository.client.Disconnect(context.Background())
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Println("Connection to MongoDB closed.")
+	}()
+
+	NewCron(repository).Run(ctx, time.Second*3)
 	r := gin.Default()
 
 	r.GET("/all-news", func(c *gin.Context) {
+		news, err := repository.GetAllNews()
+		if err != nil {
+			log.Println(err)
+			c.String(http.StatusBadRequest, "не удалось получить все новости")
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{
-			"message": repository.GetAllNews(),
+			"message": news,
 		})
 	})
 
@@ -64,7 +85,12 @@ func main() {
 			c.String(http.StatusBadRequest, "некорректные данные")
 			return
 		}
-		result, ok := repository.GetNewsByID(id)
+		result, ok, err := repository.GetNewsByID(id)
+		if err != nil {
+			log.Println(err)
+			c.String(http.StatusBadRequest, "не удалось получить новость")
+			return
+		}
 		if ok {
 			c.JSON(http.StatusOK, gin.H{
 				"message": result,
@@ -80,33 +106,27 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	defer func() {
-		err := repository.client.Disconnect(context.Background())
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Println("Connection to MongoDB closed.")
-	}()
 }
 
-func (r *Repository) InsertManyNews(news []NewsletterNewsItem) {
-	collection := r.client.Database("mydatabase").Collection("news")
+func (r *Repository) InsertManyNews(news []NewsletterNewsItem) error {
+	collection := r.client.Database(databaseName).Collection(collectionName)
 	n := make([]interface{}, len(news))
 	for i, person := range news {
 		n[i] = person
 	}
 	_, err := collection.InsertMany(context.Background(), n)
 	if err != nil {
-		log.Println(err)
+		return err
 	}
+
+	return nil
 }
 
-func (r *Repository) GetAllNews() []NewsletterNewsItem {
-	collection := r.client.Database("mydatabase").Collection("news")
+func (r *Repository) GetAllNews() ([]NewsletterNewsItem, error) {
+	collection := r.client.Database(databaseName).Collection(collectionName)
 	cursor, err := collection.Find(context.Background(), bson.M{})
 	if err != nil {
-		log.Println(err)
+		return nil, err
 	}
 
 	defer func(cursor *mongo.Cursor, ctx context.Context) {
@@ -119,36 +139,34 @@ func (r *Repository) GetAllNews() []NewsletterNewsItem {
 	var results []NewsletterNewsItem
 
 	if err = cursor.All(context.Background(), &results); err != nil {
-		log.Println(err)
+		return nil, err
 	}
 
 	if err = cursor.Err(); err != nil {
-		log.Println(err)
+		return nil, err
 	}
 
-	return results
+	return results, nil
 }
 
-func (r *Repository) GetNewsByID(id int) (NewsletterNewsItem, bool) {
-	collection := r.client.Database("mydatabase").Collection("news")
+func (r *Repository) GetNewsByID(id int) (NewsletterNewsItem, bool, error) {
+	collection := r.client.Database(databaseName).Collection(collectionName)
 
 	var result NewsletterNewsItem
 
 	err := collection.FindOne(context.Background(), bson.M{"news_article_id": id}).Decode(&result)
-	fmt.Println(result)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
-			log.Println("Запись не найдена")
-			return NewsletterNewsItem{}, false
+			return NewsletterNewsItem{}, false, err
 		}
 	}
 
-	return result, true
+	return result, true, nil
 }
 
-func (r *Repository) GetNewsWithMaxDate() (NewsletterNewsItem, bool) {
+func (r *Repository) GetNewsWithMaxDate() (NewsletterNewsItem, bool, error) {
 	var result NewsletterNewsItem
-	collection := r.client.Database("mydatabase").Collection("news")
+	collection := r.client.Database(databaseName).Collection(collectionName)
 
 	pipeline := []bson.M{
 		{
@@ -161,7 +179,7 @@ func (r *Repository) GetNewsWithMaxDate() (NewsletterNewsItem, bool) {
 
 	cursor, err := collection.Aggregate(context.Background(), pipeline)
 	if err != nil {
-		log.Fatal(err)
+		return NewsletterNewsItem{}, false, err
 	}
 
 	defer func(cursor *mongo.Cursor, ctx context.Context) {
@@ -173,14 +191,14 @@ func (r *Repository) GetNewsWithMaxDate() (NewsletterNewsItem, bool) {
 
 	if cursor.Next(context.Background()) {
 		if err = cursor.Decode(&result); err != nil {
-			log.Fatal(err)
+			return NewsletterNewsItem{}, false, err
 		}
 	} else {
 		log.Println("Запись не найдена")
-		return result, false
+		return result, false, err
 	}
 
-	return result, true
+	return result, true, nil
 }
 
 func NewRepository() *Repository {
@@ -198,48 +216,63 @@ func NewRepository() *Repository {
 	return &Repository{client}
 }
 
-func (c *Cron) Run(duration time.Duration) {
+func (c *Cron) Run(ctx context.Context, duration time.Duration) {
 	go func() {
 		for {
-			url := fmt.Sprintf("https://www.htafc.com/api/incrowd/getnewlistinformation?count=%d", numberOfRequestedNews)
-			response, err := c.client.R().Get(url)
-			if err != nil {
-				log.Println("Ошибка при выполнении GET-запроса:", err)
-				continue
-			}
-
-			var newsItems NewsletterNewsItems
-			newItemsNewsToInsert := make([]NewsletterNewsItem, 0, numberOfRequestedNews)
-			err = xml.Unmarshal(response.Body(), &newsItems)
-			if err != nil {
-				log.Println("Ошибка при разборе XML:", err)
-				continue
-			}
-
-			news, ok := c.repository.GetNewsWithMaxDate()
-
-			if ok {
-				for _, item := range newsItems.NewsletterNewsItems {
-					date1, err := c.formattingDate(news.LastUpdateDate)
-					if err != nil {
-						continue
-					}
-
-					date2, err := c.formattingDate(item.LastUpdateDate)
-					if err != nil {
-						continue
-					}
-
-					if date1.Before(date2) { // если date2 больше date1
-						newItemsNewsToInsert = append(newItemsNewsToInsert, item)
-					}
-
+			select {
+			case <-ctx.Done():
+				log.Println("Cron stopped")
+				return
+			default:
+				url := fmt.Sprintf("https://www.htafc.com/api/incrowd/getnewlistinformation?count=%d", numberOfRequestedNews)
+				response, err := c.client.R().Get(url)
+				if err != nil {
+					log.Println("Ошибка при выполнении GET-запроса:", err)
+					continue
 				}
-				if len(newItemsNewsToInsert) > 0 { // проверка на то что среди новостей из запроса удалось найти хотя бы одну новую новость
-					c.repository.InsertManyNews(newItemsNewsToInsert)
+
+				var newsItems NewsletterNewsItems
+				newItemsNewsToInsert := make([]NewsletterNewsItem, 0, numberOfRequestedNews)
+				err = xml.Unmarshal(response.Body(), &newsItems)
+				if err != nil {
+					log.Println("Ошибка при разборе XML:", err)
+					continue
 				}
-			} else {
-				c.repository.InsertManyNews(newsItems.NewsletterNewsItems) // когда база пустая и не удалось достать max дату
+
+				news, ok, err := c.repository.GetNewsWithMaxDate()
+				if err != nil {
+					log.Println(err)
+				}
+
+				if ok {
+					for _, item := range newsItems.NewsletterNewsItems {
+						date1, err := c.formattingDate(news.LastUpdateDate)
+						if err != nil {
+							continue
+						}
+
+						date2, err := c.formattingDate(item.LastUpdateDate)
+						if err != nil {
+							continue
+						}
+
+						if date1.Before(date2) { // если date2 больше date1
+							newItemsNewsToInsert = append(newItemsNewsToInsert, item)
+						}
+
+					}
+					if len(newItemsNewsToInsert) > 0 { // проверка на то что среди новостей из запроса удалось найти хотя бы одну новую новость
+						err = c.repository.InsertManyNews(newItemsNewsToInsert)
+						if err != nil {
+							log.Println(err)
+						}
+					}
+				} else {
+					err = c.repository.InsertManyNews(newsItems.NewsletterNewsItems) // когда база пустая и не удалось достать max дату
+					if err != nil {
+						log.Println(err)
+					}
+				}
 			}
 
 			time.Sleep(duration)
